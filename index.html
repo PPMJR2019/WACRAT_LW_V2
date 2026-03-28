@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<meta name="viewport" content="initial-scale=1,user-scalable=no,maximum-scale=1,width=device-width">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="stylesheet" href="css/leaflet.css">
+<link rel="stylesheet" href="css/L.Control.Layers.Tree.css">
+<link rel="stylesheet" href="css/qgis2web.css">
+<link rel="stylesheet" href="css/fontawesome-all.min.css">
+<link rel="stylesheet" href="css/leaflet.photon.css">
+<link rel="stylesheet" href="css/leaflet-measure.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+html, body, #map {
+    width: 100%;
+    height: 100%;
+    padding: 0;
+    margin: 0;
+}
+.export-btn {
+    z-index: 1000;
+    background: #006837;
+    color: white;
+    padding: 8px 12px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: bold;
+    margin-bottom: 6px;
+}
+.export-btn:hover { background: #004d26; }
+.leaflet-popup-content {
+    max-width: 400px;
+    line-height: 1.5;
+}
+#live-video {
+    width: 100%;
+    max-height: 280px;
+    background: #000;
+    border-radius: 6px;
+}
+#photo-preview img {
+    max-width: 100%;
+    max-height: 280px;
+    border: 2px solid #ddd;
+    border-radius: 6px;
+    margin: 8px 0;
+}
+.css_SucoBoundary_12 {
+    color: #323232;
+    font-size: 12pt;
+    font-weight: bold;
+    font-family: 'Calibri', sans-serif;
+    text-shadow: 1px 1px 2px white;
+}
+.crosshair-marker {
+    background: transparent;
+    border: 3px solid #ff0000;
+    border-radius: 50%;
+    width: 24px;
+    height: 24px;
+    box-shadow: 0 0 0 3px rgba(255,0,0,0.3);
+}
+.control-group { margin: 10px 0; }
+.control-group label { display: block; margin-bottom: 4px; font-weight: bold; }
+.resolution-select, .quality-slider { width: 100%; padding: 6px; border-radius: 4px; }
+.quality-value { font-weight: bold; color: #006837; }
+</style>
+<title>WACRAT Ground Truthing</title>
+</head>
+<body>
+<div id="map"></div>
+
+<!-- Bottom-left: All action buttons -->
+<div style="position:absolute; bottom:20px; left:20px; z-index:1000; display:flex; flex-direction:column; gap:8px;">
+    <button id="locate-btn" class="export-btn">📍 GPS: OFF</button>
+    <button id="load-geojson" class="export-btn" onclick="document.getElementById('file-input').click()">📤 Load GeoJSON</button>
+    <button id="export-geojson" class="export-btn" style="display: none;" onclick="exportGroundTruth()">📥 Export Ground Truth</button>
+    <button id="export-zip" class="export-btn" style="display: none;" onclick="exportPhotosAsZip()">📸 Export Photos (ZIP)</button>
+    <button id="export-measurements" class="export-btn" onclick="exportMeasurements()">📏 Export Measurements (GeoJSON)</button>
+</div>
+
+<input type="file" id="file-input" accept=".geojson" style="display:none;" onchange="loadGeoJSON(event)">
+
+<script src="js/qgis2web_expressions.js"></script>
+<script src="js/leaflet.js"></script>
+<script src="js/L.Control.Layers.Tree.min.js"></script>
+<script src="js/multi-style-layer.js"></script>
+<script src="js/leaflet.rotatedMarker.js"></script>
+<script src="js/leaflet.pattern.js"></script>
+<script src="js/leaflet-hash.js"></script>
+<script src="js/Autolinker.min.js"></script>
+<script src="js/rbush.min.js"></script>
+<script src="js/labelgun.min.js"></script>
+<script src="js/labels.js"></script>
+<script src="js/leaflet.photon.js"></script>
+<script src="js/leaflet-measure.js"></script>
+<script src="data/SucoBoundary_12.js"></script>
+
+<script>
+var highlightLayer;
+function highlightFeature(e) {
+    highlightLayer = e.target;
+    highlightLayer.openPopup();
+}
+
+var map = L.map('map', {
+    zoomControl: false,
+    maxZoom: 18,
+    minZoom: 1
+}).setView([-8.66, 125.77], 13);
+
+var hash = new L.Hash(map);
+map.attributionControl.setPrefix('<a href="https://github.com/tomchadwin/qgis2web" target="_blank">qgis2web</a> &middot; <a href="https://leafletjs.com">Leaflet</a> &middot; <a href="https://qgis.org">QGIS</a>');
+
+var autolinker = new Autolinker({truncate: {length: 30, location: 'smart'}});
+
+function removeEmptyRowsFromPopupContent(content, feature) {
+    var tempDiv = document.createElement('div');
+    tempDiv.innerHTML = content;
+    var rows = tempDiv.querySelectorAll('tr');
+    for (var i = 0; i < rows.length; i++) {
+        var td = rows[i].querySelector('td.visible-with-data');
+        if (td && td.classList.contains('visible-with-data') && feature.properties[td.id] == null) {
+            rows[i].parentNode.removeChild(rows[i]);
+        }
+    }
+    return tempDiv.innerHTML;
+}
+
+function addClassToPopupIfMedia(content, popup) {
+    var tempDiv = document.createElement('div');
+    tempDiv.innerHTML = content;
+    if (tempDiv.querySelector('td img')) {
+        popup._contentNode.classList.add('media');
+        setTimeout(function() { popup.update(); }, 10);
+    }
+}
+
+// Zoom + Measure control
+L.control.zoom({ position: 'topleft' }).addTo(map);
+
+var measureControl = new L.Control.Measure({ 
+    position: 'topleft',
+    primaryLengthUnit: 'meters',
+    secondaryLengthUnit: 'kilometers',
+    primaryAreaUnit: 'hectares',
+    secondaryAreaUnit: 'sqmeters'
+}).addTo(map);
+
+if (document.getElementsByClassName('leaflet-control-measure-toggle')[0]) {
+    var toggleBtn = document.getElementsByClassName('leaflet-control-measure-toggle')[0];
+    toggleBtn.innerHTML = '';
+    toggleBtn.className += ' fas fa-ruler';
+}
+
+// ==================== ALL LAYERS ====================
+map.createPane('pane_GoogleEarth_0');
+map.getPane('pane_GoogleEarth_0').style.zIndex = 400;
+var layer_GoogleEarth_0 = L.tileLayer('https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}', {
+    pane: 'pane_GoogleEarth_0', opacity: 1.0, minZoom: 1, maxZoom: 28
+});
+map.addLayer(layer_GoogleEarth_0);
+
+// All image overlays
+const bounds = [[-8.878072961541584,125.47128883864514],[-8.494093261755614,126.05463917667215]];
+const layerNames = ['Subzones_1','Zone5_2','Zone234_3','ClimateRiskHotspots_4','FireVulnerability_5',
+                    'LandslideSusceptibility_6','FloodSusceptibility_7','LandUse_8','Aspect_9','Slope_10','Elevation_11'];
+
+layerNames.forEach((name, i) => {
+    map.createPane('pane_' + name);
+    map.getPane('pane_' + name).style.zIndex = 401 + i;
+    var boundsToUse = (name === 'FloodSusceptibility_7') 
+        ? [[-8.878072961885035,125.471288838562],[-8.494093262038163,126.05463917641035]] 
+        : bounds;
+    window['layer_' + name] = new L.imageOverlay('data/' + name + '.png', boundsToUse, {pane: 'pane_' + name});
+    map.addLayer(window['layer_' + name]);
+});
+
+// ==================== SUCO BOUNDARY WITH STATIC LABELS ====================
+map.createPane('pane_SucoBoundary_12');
+map.getPane('pane_SucoBoundary_12').style.zIndex = 412;
+
+function pop_SucoBoundary_12(feature, layer) {
+    layer.on({
+        mouseout: function(e) { if (typeof layer.closePopup == 'function') layer.closePopup(); },
+        mouseover: highlightFeature
+    });
+    var popupContent = '<table>' +
+        '<tr><th scope="row">SUCO</th><td>' + (feature.properties['SUCO'] !== null ? autolinker.link(String(feature.properties['SUCO'])) : '') + '</td></tr>' +
+        '</table>';
+    var content = removeEmptyRowsFromPopupContent(popupContent, feature);
+    layer.on('popupopen', function(e) { addClassToPopupIfMedia(content, e.popup); });
+    layer.bindPopup(content, { maxHeight: 400 });
+}
+
+function style_SucoBoundary_12_0() {
+    return { pane: 'pane_SucoBoundary_12', color: 'rgba(255,255,255,1.0)', weight: 5.0, fillOpacity: 1, fillColor: 'rgba(231,113,72,0.0)', interactive: false };
+}
+function style_SucoBoundary_12_1() {
+    return { pane: 'pane_SucoBoundary_12', color: 'rgba(35,35,35,1.0)', weight: 1.0, fillOpacity: 1, fillColor: 'rgba(0,0,255,0.0)', interactive: false };
+}
+
+var layer_SucoBoundary_12 = new L.geoJson.multiStyle(json_SucoBoundary_12, {
+    pane: 'pane_SucoBoundary_12',
+    onEachFeature: pop_SucoBoundary_12,
+    styles: [style_SucoBoundary_12_0, style_SucoBoundary_12_1]
+});
+map.addLayer(layer_SucoBoundary_12);
+
+// Static labels restored
+layer_SucoBoundary_12.eachLayer(function(layer) {
+    if (layer.feature && layer.feature.properties && layer.feature.properties['SUCO']) {
+        layer.bindTooltip('<div class="css_SucoBoundary_12">' + layer.feature.properties['SUCO'] + '</div>',
+            { permanent: true, offset: [0, -16], direction: 'center' });
+    }
+});
+
+// ==================== GPS CROSS-HAIR + TOGGLE ====================
+var locateMarker = null;
+var locateCircle = null;
+var watchId = null;
+var isTracking = false;
+
+function toggleGPS() {
+    var btn = document.getElementById('locate-btn');
+    if (isTracking) {
+        if (watchId) navigator.geolocation.clearWatch(watchId);
+        if (locateMarker) map.removeLayer(locateMarker);
+        if (locateCircle) map.removeLayer(locateCircle);
+        isTracking = false;
+        btn.textContent = "📍 GPS: OFF";
+        btn.style.background = "#006837";
+    } else {
+        btn.textContent = "📍 GPS: ON";
+        btn.style.background = "#d32f2f";
+        isTracking = true;
+        watchId = navigator.geolocation.watchPosition(function(pos) {
+            var lat = pos.coords.latitude;
+            var lng = pos.coords.longitude;
+            var acc = pos.coords.accuracy || 50;
+            if (locateMarker) map.removeLayer(locateMarker);
+            if (locateCircle) map.removeLayer(locateCircle);
+            locateMarker = L.marker([lat, lng], {
+                icon: L.divIcon({ className: 'crosshair-marker', iconSize: [24,24], iconAnchor: [12,12] })
+            }).addTo(map);
+            locateCircle = L.circle([lat, lng], acc, {
+                color: '#3388ff', fillColor: '#3388ff', fillOpacity: 0.15
+            }).addTo(map);
+            if (isTracking) map.flyTo([lat, lng], map.getZoom(), { duration: 1.2 });
+        }, function(err) {
+            alert("GPS Error: " + err.message);
+            toggleGPS();
+        }, { enableHighAccuracy: true, timeout: 15000 });
+    }
+}
+document.getElementById('locate-btn').addEventListener('click', toggleGPS);
+
+// ==================== GROUND TRUTH WITH PHOTO CONTROLS ====================
+var gtLayer = L.featureGroup().addTo(map);
+var groundTruthPoints = [];
+var capturedPhotoData = null;
+var currentStream = null;
+var currentResolution = { width: 1280, height: 720 };
+var currentQuality = 0.85;
+
+map.on('click', function(e) {
+    var popupContent = `
+        <strong>New Ground Truth Point</strong><br>
+        Lat: ${e.latlng.lat.toFixed(5)} | Lng: ${e.latlng.lng.toFixed(5)}<br><br>
+        <textarea id="gt-note" rows="3" style="width:100%; box-sizing:border-box;" placeholder="Enter your field observation / note here..."></textarea><br><br>
+        
+        <strong>📸 Photo Capture:</strong><br>
+        <button onclick="startLiveCamera()" style="padding:8px 12px; margin:4px;">📹 Live Camera + Controls</button>
+        <button onclick="useSimpleCamera()" style="padding:8px 12px; margin:4px;">📷 Simple Camera (Native)</button><br><br>
+
+        <div id="photo-controls" style="display:none; background:#f8f8f8; padding:10px; border-radius:6px;">
+            <div class="control-group">
+                <label>Resolution:</label>
+                <select id="res-select" class="resolution-select" onchange="updateSettings()">
+                    <option value="low">Low (640×480)</option>
+                    <option value="medium" selected>Medium (1280×720) - Recommended</option>
+                    <option value="high">High (1920×1080)</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <label>JPEG Quality: <span id="quality-value" class="quality-value">85%</span></label>
+                <input type="range" id="quality-slider" min="70" max="95" value="85" step="5" 
+                       oninput="updateQuality(this.value)" style="width:100%;">
+            </div>
+        </div>
+
+        <div id="camera-container" style="display:none;">
+            <video id="live-video" autoplay playsinline></video><br>
+            <button onclick="captureFromLive()" style="background:#006837; color:white; padding:10px 16px;">📸 Capture Photo</button>
+            <button onclick="stopLiveCamera()" style="padding:8px 12px;">Cancel</button>
+        </div>
+
+        <div id="photo-preview" style="display:none; text-align:center;">
+            <img id="preview-img" alt="Preview">
+        </div>
+
+        <button onclick="saveGT(${e.latlng.lat}, ${e.latlng.lng})" 
+                style="padding:12px 20px; background:#006837; color:white; border:none; border-radius:4px; margin-top:12px; width:100%;">
+            💾 Save Observation
+        </button>
+    `;
+    L.popup({ maxWidth: 400 }).setLatLng(e.latlng).setContent(popupContent).openOn(map);
+});
+
+window.updateSettings = function() {
+    var val = document.getElementById('res-select').value;
+    if (val === 'low') currentResolution = { width: 640, height: 480 };
+    else if (val === 'medium') currentResolution = { width: 1280, height: 720 };
+    else currentResolution = { width: 1920, height: 1080 };
+};
+
+window.updateQuality = function(val) {
+    currentQuality = parseInt(val) / 100;
+    document.getElementById('quality-value').textContent = val + '%';
+};
+
+window.startLiveCamera = function() {
+    document.getElementById('photo-controls').style.display = 'block';
+    stopLiveCamera();
+    var container = document.getElementById('camera-container');
+    var video = document.getElementById('live-video');
+    container.style.display = 'block';
+
+    navigator.mediaDevices.getUserMedia({
+        video: {
+            facingMode: "environment",
+            width: { ideal: currentResolution.width },
+            height: { ideal: currentResolution.height }
+        }
+    }).then(stream => {
+        currentStream = stream;
+        video.srcObject = stream;
+    }).catch(() => {
+        alert("Live camera failed. Using simple camera.");
+        useSimpleCamera();
+    });
+};
+
+window.captureFromLive = function() {
+    var video = document.getElementById('live-video');
+    var canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth || currentResolution.width;
+    canvas.height = video.videoHeight || currentResolution.height;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+    capturedPhotoData = canvas.toDataURL('image/jpeg', currentQuality);
+
+    document.getElementById('preview-img').src = capturedPhotoData;
+    document.getElementById('photo-preview').style.display = 'block';
+    document.getElementById('camera-container').style.display = 'none';
+    stopLiveCamera();
+};
+
+window.stopLiveCamera = function() {
+    if (currentStream) {
+        currentStream.getTracks().forEach(track => track.stop());
+        currentStream = null;
+    }
+    document.getElementById('camera-container').style.display = 'none';
+    document.getElementById('photo-controls').style.display = 'none';
+};
+
+window.useSimpleCamera = function() {
+    stopLiveCamera();
+    var input = document.createElement('input');
+    input.type = 'file';
+    input.accept = 'image/*';
+    input.capture = 'camera';
+    input.onchange = function(e) {
+        if (e.target.files && e.target.files[0]) {
+            var reader = new FileReader();
+            reader.onload = function(ev) {
+                capturedPhotoData = ev.target.result;
+                document.getElementById('preview-img').src = capturedPhotoData;
+                document.getElementById('photo-preview').style.display = 'block';
+            };
+            reader.readAsDataURL(e.target.files[0]);
+        }
+    };
+    input.click();
+};
+
+window.saveGT = function(lat, lng) {
+    var note = document.getElementById("gt-note").value.trim() || "No description";
+    var photoData = capturedPhotoData;
+    var photoFilename = photoData ? `photo_${Date.now()}.jpg` : null;
+    var popupHTML = `<strong>Field Observation</strong><br>${note}<br><br>`;
+    if (photoData) popupHTML += `<img src="${photoData}" style="max-width:100%; max-height:260px; border-radius:6px; border:1px solid #ccc;"><br><br>`;
+    popupHTML += `<button onclick="deleteThisPoint(this)" style="color:red; padding:6px 12px;">🗑 Delete Point</button>`;
+    
+    L.marker([lat, lng]).bindPopup(popupHTML, {maxWidth: 320}).addTo(gtLayer);
+    
+    groundTruthPoints.push({
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [lng, lat] },
+        properties: {
+            timestamp: new Date().toISOString(),
+            note: note,
+            photo: photoData,
+            photoFilename: photoFilename
+        }
+    });
+    map.closePopup();
+    document.getElementById("export-geojson").style.display = "inline-block";
+    document.getElementById("export-zip").style.display = "inline-block";
+    capturedPhotoData = null;
+};
+
+window.deleteThisPoint = function(btn) {
+    if (confirm("Delete this observation point?")) {
+        gtLayer.eachLayer(function(layer) {
+            if (layer.getPopup() && layer.getPopup().getContent().indexOf(btn.parentNode.innerHTML) > -1) {
+                gtLayer.removeLayer(layer);
+            }
+        });
+    }
+};
+
+// ==================== MEASUREMENTS ====================
+var measurementLayer = L.featureGroup().addTo(map);
+var measurements = [];
+
+map.on('measurefinish', function(e) {
+    var points = e.points || [];
+    if (points.length < 2) return;
+
+    var feature = null;
+    if (e.area && e.area > 0) {
+        var coords = points.map(p => [p.lng || p.lon || p.x, p.lat || p.y]);
+        coords.push(coords[0]);
+        feature = {
+            type: "Feature",
+            geometry: { type: "Polygon", coordinates: [coords] },
+            properties: {
+                timestamp: new Date().toISOString(),
+                type: "area",
+                area_m2: parseFloat(e.area),
+                area_ha: (parseFloat(e.area) / 10000).toFixed(4)
+            }
+        };
+    } else if (e.length && e.length > 0) {
+        var coords = points.map(p => [p.lng || p.lon || p.x, p.lat || p.y]);
+        feature = {
+            type: "Feature",
+            geometry: { type: "LineString", coordinates: coords },
+            properties: {
+                timestamp: new Date().toISOString(),
+                type: "distance",
+                distance_m: parseFloat(e.length),
+                distance_km: (parseFloat(e.length) / 1000).toFixed(3)
+            }
+        };
+    }
+
+    if (feature) {
+        measurements.push(feature);
+        L.geoJSON(feature, {
+            style: feature.geometry.type === "Polygon" 
+                ? { color: "#ff7800", weight: 4, opacity: 0.9, fillOpacity: 0.2 }
+                : { color: "#3388ff", weight: 5, opacity: 0.9 },
+            onEachFeature: function(f, layer) {
+                var p = f.properties;
+                var text = p.type === "area" ? `<strong>Area</strong><br>${p.area_ha} ha` : `<strong>Distance</strong><br>${p.distance_km} km`;
+                layer.bindPopup(text);
+            }
+        }).addTo(measurementLayer);
+    }
+});
+
+window.exportMeasurements = function() {
+    if (measurements.length === 0) {
+        return alert("No measurements found.\n\nUse the ruler tool first.");
+    }
+    var geojson = {
+        type: "FeatureCollection",
+        features: measurements,
+        properties: { exported_at: new Date().toISOString() }
+    };
+    var dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(geojson, null, 2));
+    var a = document.createElement('a');
+    a.href = dataStr;
+    a.download = "wacrat_measurements_" + new Date().toISOString().slice(0,10) + ".geojson";
+    a.click();
+};
+
+// Load & Export functions
+window.loadGeoJSON = function(event) {
+    var file = event.target.files[0];
+    if (!file) return;
+    var reader = new FileReader();
+    reader.onload = function(e) {
+        try {
+            var geojson = JSON.parse(e.target.result);
+            var pointsLoaded = 0, measLoaded = 0;
+            geojson.features.forEach(function(f) {
+                if (f.geometry.type === "Point") {
+                    var coords = f.geometry.coordinates;
+                    var p = f.properties || {};
+                    var popupHTML = `<strong>Field Observation</strong><br>${p.note || "No description"}<br><br>`;
+                    if (p.photo) popupHTML += `<img src="${p.photo}" style="max-width:100%; max-height:260px; border-radius:6px;"><br><br>`;
+                    popupHTML += `<button onclick="deleteThisPoint(this)" style="color:red; padding:6px 12px;">🗑 Delete</button>`;
+                    L.marker([coords[1], coords[0]]).bindPopup(popupHTML).addTo(gtLayer);
+                    groundTruthPoints.push(f);
+                    pointsLoaded++;
+                } else if (f.geometry.type === "LineString" || f.geometry.type === "Polygon") {
+                    measurements.push(f);
+                    L.geoJSON(f, {
+                        style: f.geometry.type === "Polygon" ? {color:"#ff7800", weight:4, fillOpacity:0.2} : {color:"#3388ff", weight:5}
+                    }).addTo(measurementLayer);
+                    measLoaded++;
+                }
+            });
+            if (pointsLoaded > 0) {
+                document.getElementById("export-geojson").style.display = "inline-block";
+                document.getElementById("export-zip").style.display = "inline-block";
+            }
+            alert(`Loaded ${pointsLoaded} points and ${measLoaded} measurements`);
+        } catch(err) {
+            alert("Invalid GeoJSON file");
+        }
+    };
+    reader.readAsText(file);
+};
+
+window.exportGroundTruth = function() {
+    if (groundTruthPoints.length === 0) return alert("No points to export.");
+    var geojson = { type: "FeatureCollection", features: groundTruthPoints };
+    var dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(geojson, null, 2));
+    var a = document.createElement('a');
+    a.href = dataStr;
+    a.download = "wacrat_ground_truth_" + new Date().toISOString().slice(0,10) + ".geojson";
+    a.click();
+};
+
+window.exportPhotosAsZip = async function() {
+    if (typeof JSZip === "undefined") return alert("JSZip not available.");
+    var photos = groundTruthPoints.filter(p => p.properties && p.properties.photo);
+    if (photos.length === 0) return alert("No photos to export.");
+    var zip = new JSZip();
+    var folder = zip.folder("wacrat_photos");
+    for (var i = 0; i < photos.length; i++) {
+        var p = photos[i];
+        var base64 = p.properties.photo.split(',')[1];
+        var name = p.properties.photoFilename || `photo_${i+1}.jpg`;
+        folder.file(name, base64, {base64: true});
+    }
+    var blob = await zip.generateAsync({type: "blob"});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement('a');
+    a.href = url;
+    a.download = `wacrat_photos_${new Date().toISOString().slice(0,10)}.zip`;
+    a.click();
+    URL.revokeObjectURL(url);
+};
+
+// Layer Control
+var overlaysTree = [
+    {label: '<img src="legend/SucoBoundary_12.png" /> Suco Boundary', layer: layer_SucoBoundary_12},
+    {label: "Elevation", layer: layer_Elevation_11},
+    {label: "Slope", layer: layer_Slope_10},
+    {label: "Aspect", layer: layer_Aspect_9},
+    {label: "Land Use", layer: layer_LandUse_8},
+    {label: "Flood Susceptibility", layer: layer_FloodSusceptibility_7},
+    {label: "Landslide Susceptibility", layer: layer_LandslideSusceptibility_6},
+    {label: "Fire Vulnerability", layer: layer_FireVulnerability_5},
+    {label: "Climate Risk Hotspots", layer: layer_ClimateRiskHotspots_4},
+    {label: "Zone 2-3-4", layer: layer_Zone234_3},
+    {label: "Zone 5", layer: layer_Zone5_2},
+    {label: "Sub-zones", layer: layer_Subzones_1},
+    {label: "Google Earth", layer: layer_GoogleEarth_0, radioGroup: 'bm'},
+    {label: "📍 Ground Truth Points", layer: gtLayer},
+    {label: "📏 Measurements", layer: measurementLayer}
+];
+
+L.control.layers.tree(null, overlaysTree, {
+    collapsed: true,
+    position: 'topright'
+}).addTo(map);
+
+console.log("✅ WACRAT Ground Truthing - Full version with static Suco labels restored");
+</script>
+</body>
+</html>
